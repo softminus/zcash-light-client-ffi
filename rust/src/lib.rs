@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use failure::format_err;
 use ffi_helpers::panic::catch_panic;
 use schemer::MigratorError;
@@ -20,21 +22,22 @@ use zcash_address::{
 use zcash_client_backend::{
     address::{RecipientAddress, UnifiedAddress},
     data_api::{
-        chain::{scan_cached_blocks, validate_chain},
-        error::Error,
+        chain::{self, scan_cached_blocks, validate_chain},
         wallet::{
-            create_spend_to_address, decrypt_and_store_transaction, shield_transparent_funds,
+            decrypt_and_store_transaction, input_selection::GreedyInputSelector,
+            shield_transparent_funds, spend,
         },
         WalletRead, WalletWrite,
     },
     encoding::{decode_extended_full_viewing_key, decode_extended_spending_key, AddressCodec},
+    fees::{fixed, zip317, DustOutputPolicy},
     keys::{DecodingError, Era, UnifiedFullViewingKey, UnifiedSpendingKey},
     wallet::{OvkPolicy, WalletTransparentOutput},
+    zip321::{Payment, TransactionRequest},
 };
 #[allow(deprecated)]
 use zcash_client_sqlite::wallet::get_rewind_height;
 use zcash_client_sqlite::{
-    error::SqliteClientError,
     wallet::init::{init_accounts_table, init_blocks_table, init_wallet_db, WalletMigrationError},
     BlockDb, NoteId, WalletDb,
 };
@@ -46,6 +49,8 @@ use zcash_primitives::{
     memo::{Memo, MemoBytes},
     transaction::{
         components::{Amount, OutPoint, TxOut},
+        fees::fixed::FeeRule as FixedFeeRule,
+        fees::zip317::FeeRule as Zip317FeeRule,
         Transaction,
     },
     zip32::AccountId,
@@ -86,10 +91,9 @@ unsafe fn wallet_db(
     db_data_len: usize,
     network: Network,
 ) -> Result<WalletDb<Network>, failure::Error> {
-    let db_data = Path::new(OsStr::from_bytes(slice::from_raw_parts(
-        db_data,
-        db_data_len,
-    )));
+    let db_data = Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }));
     WalletDb::for_path(db_data, network)
         .map_err(|e| format_err!("Error opening wallet database connection: {}", e))
 }
@@ -105,10 +109,9 @@ unsafe fn wallet_db(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 unsafe fn block_db(cache_db: *const u8, cache_db_len: usize) -> Result<BlockDb, failure::Error> {
-    let cache_db = Path::new(OsStr::from_bytes(slice::from_raw_parts(
-        cache_db,
-        cache_db_len,
-    )));
+    let cache_db = Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(cache_db, cache_db_len)
+    }));
     BlockDb::for_path(cache_db)
         .map_err(|e| format_err!("Error opening block source database connection: {}", e))
 }
@@ -130,7 +133,7 @@ pub extern "C" fn zcashlc_last_error_length() -> i32 {
 ///   pointer::offset.
 #[no_mangle]
 pub unsafe extern "C" fn zcashlc_error_message_utf8(buf: *mut c_char, length: i32) -> i32 {
-    ffi_helpers::error_handling::error_message_utf8(buf, length)
+    unsafe { ffi_helpers::error_handling::error_message_utf8(buf, length) }
 }
 
 /// Clears the record of the last error message.
@@ -160,7 +163,7 @@ pub extern "C" fn zcashlc_clear_last_error() {
 /// - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
 ///   of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_init_data_database(
+pub unsafe extern "C" fn zcashlc_init_data_database(
     db_data: *const u8,
     db_data_len: usize,
     seed: *const u8,
@@ -221,9 +224,10 @@ impl FFIBinaryKey {
 #[no_mangle]
 pub unsafe extern "C" fn zcashlc_free_binary_key(ptr: *mut FFIBinaryKey) {
     if !ptr.is_null() {
-        let key: Box<FFIBinaryKey> = Box::from_raw(ptr);
-        let key_slice: &mut [u8] = slice::from_raw_parts_mut(key.encoding, key.encoding_len);
-        drop(Box::from_raw(key_slice));
+        let key: Box<FFIBinaryKey> = unsafe { Box::from_raw(ptr) };
+        let key_slice: &mut [u8] =
+            unsafe { slice::from_raw_parts_mut(key.encoding, key.encoding_len) };
+        drop(unsafe { Box::from_raw(key_slice) });
     }
 }
 
@@ -239,7 +243,7 @@ pub unsafe extern "C" fn zcashlc_free_binary_key(ptr: *mut FFIBinaryKey) {
 /// accounts before scanning the chain from the seed's birthday height.
 ///
 /// By convention, wallets should only allow a new account to be generated after funds
-/// have been received by the currently-available account (in order to enable
+/// have been received by the currently available account (in order to enable
 /// automated account recovery).
 ///
 /// # Safety
@@ -260,7 +264,7 @@ pub unsafe extern "C" fn zcashlc_free_binary_key(ptr: *mut FFIBinaryKey) {
 ///
 /// [ZIP 316]: https://zips.z.cash/zip-0316
 #[no_mangle]
-pub extern "C" fn zcashlc_create_account(
+pub unsafe extern "C" fn zcashlc_create_account(
     db_data: *const u8,
     db_data_len: usize,
     seed: *const u8,
@@ -341,11 +345,11 @@ impl FFIEncodedKeys {
 #[no_mangle]
 pub unsafe extern "C" fn zcashlc_free_keys(ptr: *mut FFIEncodedKeys) {
     if !ptr.is_null() {
-        let s: Box<FFIEncodedKeys> = Box::from_raw(ptr);
+        let s: Box<FFIEncodedKeys> = unsafe { Box::from_raw(ptr) };
 
-        let slice: &mut [FFIEncodedKey] = slice::from_raw_parts_mut(s.ptr, s.len);
+        let slice: &mut [FFIEncodedKey] = unsafe { slice::from_raw_parts_mut(s.ptr, s.len) };
         for k in slice.into_iter() {
-            zcashlc_string_free(k.encoding)
+            unsafe { zcashlc_string_free(k.encoding) }
         }
         drop(s);
     }
@@ -364,12 +368,12 @@ pub unsafe extern "C" fn zcashlc_free_keys(ptr: *mut FFIEncodedKeys) {
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 /// - `ufvks` must be non-null and valid for reads for `ufvks_len * sizeof(FFIEncodedKey)` bytes.
-///   It must point to an array of `FFIEncodedKey` values
+///   It must point to an array of `FFIEncodedKey` values.
 /// - The memory referenced by `ufvks` must not be mutated for the duration of the function call.
 /// - The total size `ufvks_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_init_accounts_table_with_keys(
+pub unsafe extern "C" fn zcashlc_init_accounts_table_with_keys(
     db_data: *const u8,
     db_data_len: usize,
     ufvks_ptr: *mut FFIEncodedKey,
@@ -423,7 +427,7 @@ pub unsafe extern "C" fn zcashlc_derive_spending_key(
 ) -> *mut FFIBinaryKey {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let seed = slice::from_raw_parts(seed, seed_len);
+        let seed = unsafe { slice::from_raw_parts(seed, seed_len) };
         let account = if account >= 0 {
             account as u32
         } else {
@@ -442,13 +446,14 @@ pub unsafe extern "C" fn zcashlc_derive_spending_key(
 }
 
 /// A private utility function to reduce duplication across functions that take an USK
-/// across the FFI. Callers should reproduce the following safety documentation.
+/// across the FFI. `usk_ptr` should point to an array of `usk_len` bytes containing
+/// a unified spending key encoded as returned from the `zcashlc_create_account` or
+/// `zcashlc_derive_spending_key` functions. Callers should reproduce the following
+/// safety documentation.
 ///
 /// # Safety
 ///
-/// - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes containing a unified
-///   spending key encoded as returned from the `zcashlc_create_account` or
-///   `zcashlc_derive_spending_key` functions.
+/// - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes.
 /// - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
 /// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
 ///   of pointer::offset.
@@ -456,7 +461,7 @@ unsafe fn decode_usk(
     usk_ptr: *const u8,
     usk_len: usize,
 ) -> Result<UnifiedSpendingKey, failure::Error> {
-    let usk_bytes = slice::from_raw_parts(usk_ptr, usk_len); //unsafe
+    let usk_bytes = unsafe { slice::from_raw_parts(usk_ptr, usk_len) };
 
     // The remainder of the function is safe.
     UnifiedSpendingKey::from_bytes(Era::Orchard, usk_bytes).map_err(|e| match e {
@@ -473,20 +478,20 @@ unsafe fn decode_usk(
 }
 
 /// Obtains the unified full viewing key for the given binary-encoded unified spending key
-/// and returns the resulting encoded UFVK string.
+/// and returns the resulting encoded UFVK string. `usk_ptr` should point to an array of `usk_len`
+/// bytes containing a unified spending key encoded as returned from the `zcashlc_create_account`
+/// or `zcashlc_derive_spending_key` functions.
 ///
 /// # Safety
 ///
-/// - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes containing a unified
-///   spending key encoded as returned from the `zcashlc_create_account` or
-///   `zcashlc_derive_spending_key` functions.
+/// - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes.
 /// - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
 /// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
 ///   of pointer::offset.
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when you are done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_spending_key_to_full_viewing_key(
+pub unsafe extern "C" fn zcashlc_spending_key_to_full_viewing_key(
     usk_ptr: *const u8,
     usk_len: usize,
     network_id: u32,
@@ -506,6 +511,9 @@ pub extern "C" fn zcashlc_spending_key_to_full_viewing_key(
 /// This enables a newly-created database to be immediately-usable, without needing to
 /// synchronise historic blocks.
 ///
+/// The string represented by `sapling_tree_hex` should contain the encoded byte representation
+/// of a Sapling commitment tree.
+///
 /// # Safety
 ///
 /// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
@@ -516,12 +524,11 @@ pub extern "C" fn zcashlc_spending_key_to_full_viewing_key(
 ///   documentation of pointer::offset.
 /// - `hash_hex` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `hash_hex` must not be mutated for the duration of the function call.
-/// - `sapling_tree_hex` must be non-null and must point to a null-terminated UTF-8 string
-///   containing the encoded byte representation of a Sapling commitment tree.
+/// - `sapling_tree_hex` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `sapling_tree_hex` must not be mutated for the duration of the
 ///   function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_init_blocks_table(
+pub unsafe extern "C" fn zcashlc_init_blocks_table(
     db_data: *const u8,
     db_data_len: usize,
     height: i32,
@@ -568,7 +575,7 @@ pub extern "C" fn zcashlc_init_blocks_table(
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_current_address(
+pub unsafe extern "C" fn zcashlc_get_current_address(
     db_data: *const u8,
     db_data_len: usize,
     account: i32,
@@ -614,7 +621,7 @@ pub extern "C" fn zcashlc_get_current_address(
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_next_available_address(
+pub unsafe extern "C" fn zcashlc_get_next_available_address(
     db_data: *const u8,
     db_data_len: usize,
     account: i32,
@@ -661,7 +668,7 @@ pub extern "C" fn zcashlc_get_next_available_address(
 /// - Call [`zcashlc_free_keys`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_list_transparent_receivers(
+pub unsafe extern "C" fn zcashlc_list_transparent_receivers(
     db_data: *const u8,
     db_data_len: usize,
     account_id: i32,
@@ -715,7 +722,7 @@ pub extern "C" fn zcashlc_list_transparent_receivers(
 /// - Call [`zcashlc_free_typecodes`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_typecodes_for_unified_address_receivers(
+pub unsafe extern "C" fn zcashlc_get_typecodes_for_unified_address_receivers(
     ua: *const c_char,
     len_ret: *mut usize,
 ) -> *mut u32 {
@@ -756,7 +763,7 @@ pub extern "C" fn zcashlc_get_typecodes_for_unified_address_receivers(
 #[no_mangle]
 pub unsafe extern "C" fn zcashlc_free_typecodes(data: *mut u32, len: usize) {
     if !data.is_null() {
-        let s = Box::from_raw(slice::from_raw_parts_mut(data, len));
+        let s = unsafe { Box::from_raw(slice::from_raw_parts_mut(data, len)) };
         drop(s);
     }
 }
@@ -779,12 +786,11 @@ impl zcash_address::TryFromRawAddress for UnifiedAddressParser {
 ///
 /// # Safety
 ///
-/// - `ua` must be non-null and must point to a null-terminated UTF-8 string containing an
-///   encoded Unified Address.
+/// - `ua` must be non-null and must point to a null-terminated UTF-8 string.
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_transparent_receiver_for_unified_address(
+pub unsafe extern "C" fn zcashlc_get_transparent_receiver_for_unified_address(
     ua: *const c_char,
 ) -> *mut c_char {
     let res = catch_panic(|| {
@@ -821,12 +827,11 @@ pub extern "C" fn zcashlc_get_transparent_receiver_for_unified_address(
 ///
 /// # Safety
 ///
-/// - `ua` must be non-null and must point to a null-terminated UTF-8 string containing an
-///   encoded Unified Address.
+/// - `ua` must be non-null and must point to a null-terminated UTF-8 string.
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_sapling_receiver_for_unified_address(
+pub unsafe extern "C" fn zcashlc_get_sapling_receiver_for_unified_address(
     ua: *const c_char,
 ) -> *mut c_char {
     let res = catch_panic(|| {
@@ -861,7 +866,7 @@ pub extern "C" fn zcashlc_get_sapling_receiver_for_unified_address(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_shielded_address(
+pub unsafe extern "C" fn zcashlc_is_valid_shielded_address(
     address: *const c_char,
     network_id: u32,
 ) -> bool {
@@ -900,8 +905,7 @@ struct AddressMetadata {
 enum Void {}
 
 impl TryFromAddress for AddressMetadata {
-    /// This instance produces no errors; ideally this would be the void
-    /// (uninhabitable) type but I'm not sure how to do that in Rust.
+    /// This instance produces no errors.
     type Error = Void;
 
     fn try_from_sprout(
@@ -969,7 +973,7 @@ impl TryFromAddress for AddressMetadata {
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_address_metadata(
+pub unsafe extern "C" fn zcashlc_get_address_metadata(
     address: *const c_char,
     network_id_ret: *mut u32,
     addr_kind_ret: *mut u32,
@@ -1014,7 +1018,7 @@ pub extern "C" fn zcashlc_get_address_metadata(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_transparent_address(
+pub unsafe extern "C" fn zcashlc_is_valid_transparent_address(
     address: *const c_char,
     network_id: u32,
 ) -> bool {
@@ -1044,7 +1048,7 @@ fn is_valid_transparent_address(address: &str, network: &Network) -> bool {
 /// - `extsk` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `extsk` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_sapling_extended_spending_key(
+pub unsafe extern "C" fn zcashlc_is_valid_sapling_extended_spending_key(
     extsk: *const c_char,
     network_id: u32,
 ) -> bool {
@@ -1068,7 +1072,7 @@ pub extern "C" fn zcashlc_is_valid_sapling_extended_spending_key(
 /// - `key` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `key` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_viewing_key(key: *const c_char, network_id: u32) -> bool {
+pub unsafe extern "C" fn zcashlc_is_valid_viewing_key(key: *const c_char, network_id: u32) -> bool {
     let res =
         catch_panic(|| {
             let network = parse_network(network_id)?;
@@ -1088,10 +1092,11 @@ pub extern "C" fn zcashlc_is_valid_viewing_key(key: *const c_char, network_id: u
 ///
 /// # Safety
 ///
-/// - `ufvk` must be non-null and must point to a null-terminated UTF-8 string.  - The memory
-/// referenced by `ufvk` must not be mutated for the duration of the function call.
+/// - `ufvk` must be non-null and must point to a null-terminated UTF-8 string.
+/// - The memory referenced by `ufvk` must not be mutated for the duration of the
+///   function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_unified_full_viewing_key(
+pub unsafe extern "C" fn zcashlc_is_valid_unified_full_viewing_key(
     ufvk: *const c_char,
     network_id: u32,
 ) -> bool {
@@ -1109,10 +1114,11 @@ pub extern "C" fn zcashlc_is_valid_unified_full_viewing_key(
 ///
 /// # Safety
 ///
-/// - `address` must be non-null and must point to a null-terminated UTF-8 string.  - The memory
-/// referenced by `address` must not be mutated for the duration of the function call.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+/// - The memory referenced by `address` must not be mutated for the duration of the
+///   function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_is_valid_unified_address(
+pub unsafe extern "C" fn zcashlc_is_valid_unified_address(
     address: *const c_char,
     network_id: u32,
 ) -> bool {
@@ -1145,7 +1151,7 @@ fn is_valid_unified_address(address: &str, network: &Network) -> bool {
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_balance(
+pub unsafe extern "C" fn zcashlc_get_balance(
     db_data: *const u8,
     db_data_len: usize,
     account: i32,
@@ -1188,7 +1194,7 @@ pub extern "C" fn zcashlc_get_balance(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_verified_balance(
+pub unsafe extern "C" fn zcashlc_get_verified_balance(
     db_data: *const u8,
     db_data_len: usize,
     account: i32,
@@ -1234,7 +1240,7 @@ pub extern "C" fn zcashlc_get_verified_balance(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_verified_transparent_balance(
+pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
     db_data: *const u8,
     db_data_len: usize,
     address: *const c_char,
@@ -1251,12 +1257,12 @@ pub extern "C" fn zcashlc_get_verified_transparent_balance(
             .map_err(|e| format_err!("Error while fetching anchor height: {}", e))
             .and_then(|opt_anchor| {
                 opt_anchor
-                    .map(|(h, _)| h)
+                    .map(|(_, a)| a)
                     .ok_or_else(|| format_err!("height not available; scan required."))
             })
             .and_then(|anchor| {
                 (&db_data)
-                    .get_unspent_transparent_outputs(&taddr, anchor)
+                    .get_unspent_transparent_outputs(&taddr, anchor, &[])
                     .map_err(|e| {
                         format_err!("Error while fetching verified transparent balance: {}", e)
                     })
@@ -1285,7 +1291,7 @@ pub extern "C" fn zcashlc_get_verified_transparent_balance(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
+pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
     db_data: *const u8,
     db_data_len: usize,
     network_id: u32,
@@ -1305,7 +1311,7 @@ pub extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
             .map_err(|e| format_err!("Error while fetching anchor height: {}", e))
             .and_then(|opt_anchor| {
                 opt_anchor
-                    .map(|(h, _)| h)
+                    .map(|(_, a)| a)
                     .ok_or_else(|| format_err!("height not available; scan required."))
             })
             .and_then(|anchor| {
@@ -1323,7 +1329,7 @@ pub extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                             .iter()
                             .map(|(taddr, _)| {
                                 db_data
-                                    .get_unspent_transparent_outputs(&taddr, anchor)
+                                    .get_unspent_transparent_outputs(&taddr, anchor, &[])
                                     .map_err(|e| {
                                         format_err!(
                                             "Error while fetching verified transparent balance: {}",
@@ -1358,7 +1364,7 @@ pub extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_total_transparent_balance(
+pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
     db_data: *const u8,
     db_data_len: usize,
     address: *const c_char,
@@ -1374,12 +1380,12 @@ pub extern "C" fn zcashlc_get_total_transparent_balance(
             .map_err(|e| format_err!("Error while fetching anchor height: {}", e))
             .and_then(|opt_anchor| {
                 opt_anchor
-                    .map(|(h, _)| h)
+                    .map(|(_, a)| a)
                     .ok_or_else(|| format_err!("height not available; scan required."))
             })
             .and_then(|anchor| {
                 (&db_data)
-                    .get_unspent_transparent_outputs(&taddr, anchor)
+                    .get_unspent_transparent_outputs(&taddr, anchor, &[])
                     .map_err(|e| {
                         format_err!("Error while fetching total transparent balance: {}", e)
                     })
@@ -1407,7 +1413,7 @@ pub extern "C" fn zcashlc_get_total_transparent_balance(
 /// - `address` must be non-null and must point to a null-terminated UTF-8 string.
 /// - The memory referenced by `address` must not be mutated for the duration of the function call.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_total_transparent_balance_for_account(
+pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
     db_data: *const u8,
     db_data_len: usize,
     network_id: u32,
@@ -1426,7 +1432,7 @@ pub extern "C" fn zcashlc_get_total_transparent_balance_for_account(
             .map_err(|e| format_err!("Error while fetching anchor height: {}", e))
             .and_then(|opt_anchor| {
                 opt_anchor
-                    .map(|(h, _)| h)
+                    .map(|(_, a)| a)
                     .ok_or_else(|| format_err!("height not available; scan required."))
             })
             .and_then(|anchor| {
@@ -1466,7 +1472,7 @@ pub extern "C" fn zcashlc_get_total_transparent_balance_for_account(
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_received_memo_as_utf8(
+pub unsafe extern "C" fn zcashlc_get_received_memo_as_utf8(
     db_data: *const u8,
     db_data_len: usize,
     id_note: i64,
@@ -1506,23 +1512,37 @@ pub extern "C" fn zcashlc_get_received_memo_as_utf8(
 ///   documentation of pointer::offset.
 /// - `memo_bytes_ret` must be non-null and must point to an allocated 512-byte region of memory.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_received_memo(
+pub unsafe extern "C" fn zcashlc_get_received_memo(
     db_data: *const u8,
     db_data_len: usize,
     id_note: i64,
     memo_bytes_ret: *mut u8,
     network_id: u32,
 ) -> bool {
-    zcashlc_get_memo(
-        db_data,
-        db_data_len,
-        NoteId::ReceivedNoteId(id_note),
-        memo_bytes_ret,
-        network_id,
-    )
+    unsafe {
+        zcashlc_get_memo(
+            db_data,
+            db_data_len,
+            NoteId::ReceivedNoteId(id_note),
+            memo_bytes_ret,
+            network_id,
+        )
+    }
 }
 
-fn zcashlc_get_memo(
+/// Returns the memo for a note by copying the corresponding bytes to the received
+/// pointer in `memo_bytes_ret`.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `memo_bytes_ret` must be non-null and must point to an allocated 512-byte region of memory.
+unsafe fn zcashlc_get_memo(
     db_data: *const u8,
     db_data_len: usize,
     note_id: NoteId,
@@ -1560,7 +1580,7 @@ fn zcashlc_get_memo(
 /// - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
 ///   when done using it.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_sent_memo_as_utf8(
+pub unsafe extern "C" fn zcashlc_get_sent_memo_as_utf8(
     db_data: *const u8,
     db_data_len: usize,
     id_note: i64,
@@ -1600,20 +1620,22 @@ pub extern "C" fn zcashlc_get_sent_memo_as_utf8(
 ///   documentation of pointer::offset.
 /// - `memo_bytes_ret` must be non-null and must point to an allocated 512-byte region of memory.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_sent_memo(
+pub unsafe extern "C" fn zcashlc_get_sent_memo(
     db_data: *const u8,
     db_data_len: usize,
     id_note: i64,
     memo_bytes_ret: *mut u8,
     network_id: u32,
 ) -> bool {
-    zcashlc_get_memo(
-        db_data,
-        db_data_len,
-        NoteId::SentNoteId(id_note),
-        memo_bytes_ret,
-        network_id,
-    )
+    unsafe {
+        zcashlc_get_memo(
+            db_data,
+            db_data_len,
+            NoteId::SentNoteId(id_note),
+            memo_bytes_ret,
+            network_id,
+        )
+    }
 }
 
 /// Checks that the scanned blocks in the data database, when combined with the recent
@@ -1648,7 +1670,7 @@ pub extern "C" fn zcashlc_get_sent_memo(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_validate_combined_chain(
+pub unsafe extern "C" fn zcashlc_validate_combined_chain(
     db_cache: *const u8,
     db_cache_len: usize,
     db_data: *const u8,
@@ -1668,9 +1690,9 @@ pub extern "C" fn zcashlc_validate_combined_chain(
 
         if let Err(e) = val_res {
             match e {
-                SqliteClientError::BackendError(Error::InvalidChain(upper_bound, _)) => {
-                    let upper_bound_u32 = u32::from(upper_bound);
-                    Ok(upper_bound_u32 as i32)
+                chain::error::Error::Chain(chain_error) => {
+                    let height_u32 = u32::from(chain_error.at_height());
+                    Ok(height_u32 as i32)
                 }
                 _ => Err(format_err!("Error while validating chain: {}", e)),
             }
@@ -1694,7 +1716,7 @@ pub extern "C" fn zcashlc_validate_combined_chain(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_get_nearest_rewind_height(
+pub unsafe extern "C" fn zcashlc_get_nearest_rewind_height(
     db_data: *const u8,
     db_data_len: usize,
     height: i32,
@@ -1746,7 +1768,7 @@ pub extern "C" fn zcashlc_get_nearest_rewind_height(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_rewind_to_height(
+pub unsafe extern "C" fn zcashlc_rewind_to_height(
     db_data: *const u8,
     db_data_len: usize,
     height: i32,
@@ -1796,7 +1818,7 @@ pub extern "C" fn zcashlc_rewind_to_height(
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_scan_blocks(
+pub unsafe extern "C" fn zcashlc_scan_blocks(
     db_cache: *const u8,
     db_cache_len: usize,
     db_data: *const u8,
@@ -1843,7 +1865,7 @@ pub extern "C" fn zcashlc_scan_blocks(
 /// - The total size `script_bytes_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_put_utxo(
+pub unsafe extern "C" fn zcashlc_put_utxo(
     db_data: *const u8,
     db_data_len: usize,
     txid_bytes: *const u8,
@@ -1889,8 +1911,7 @@ pub extern "C" fn zcashlc_put_utxo(
     unwrap_exc_or(res, false)
 }
 
-/// Attempts to decrypt the specified transaction from its network byte representation
-/// and store its
+/// Decrypts whatever parts of the specified transaction it can and stores them in db_data.
 ///
 /// # Safety
 ///
@@ -1906,7 +1927,7 @@ pub extern "C" fn zcashlc_put_utxo(
 /// - The total size `tx_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_decrypt_and_store_transaction(
+pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
     db_data: *const u8,
     db_data_len: usize,
     tx: *const u8,
@@ -1973,7 +1994,7 @@ pub extern "C" fn zcashlc_decrypt_and_store_transaction(
 /// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_create_to_address(
+pub unsafe extern "C" fn zcashlc_create_to_address(
     db_data: *const u8,
     db_data_len: usize,
     usk_ptr: *const u8,
@@ -1987,6 +2008,7 @@ pub extern "C" fn zcashlc_create_to_address(
     output_params_len: usize,
     network_id: u32,
     min_confirmations: u32,
+    use_zip317_fees: bool,
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
@@ -2033,18 +2055,51 @@ pub extern "C" fn zcashlc_create_to_address(
 
         let prover = LocalTxProver::new(spend_params, output_params);
 
-        create_spend_to_address(
-            &mut db_data,
-            &network,
-            prover,
-            &usk,
-            &to,
-            value,
-            memo,
-            OvkPolicy::Sender,
-            min_confirmations,
-        )
-        .map_err(|e| format_err!("Error while sending funds: {}", e))
+        let req = TransactionRequest::new(vec![Payment {
+            recipient_address: to,
+            amount: value,
+            memo: memo,
+            label: None,
+            message: None,
+            other_params: vec![],
+        }])
+        .map_err(|e| format_err!("Error creating transaction request: {:?}", e))?;
+
+        if use_zip317_fees {
+            let input_selector = GreedyInputSelector::new(
+                zip317::SingleOutputChangeStrategy::new(Zip317FeeRule::standard()),
+                DustOutputPolicy::default(),
+            );
+
+            spend(
+                &mut db_data,
+                &network,
+                prover,
+                &input_selector,
+                &usk,
+                req,
+                OvkPolicy::Sender,
+                min_confirmations,
+            )
+            .map_err(|e| format_err!("Error while sending funds: {}", e))
+        } else {
+            let input_selector = GreedyInputSelector::new(
+                fixed::SingleOutputChangeStrategy::new(FixedFeeRule::standard()),
+                DustOutputPolicy::default(),
+            );
+
+            spend(
+                &mut db_data,
+                &network,
+                prover,
+                &input_selector,
+                &usk,
+                req,
+                OvkPolicy::Sender,
+                min_confirmations,
+            )
+            .map_err(|e| format_err!("Error while sending funds: {}", e))
+        }
     });
     unwrap_exc_or(res, -1)
 }
@@ -2064,12 +2119,12 @@ pub extern "C" fn zcashlc_branch_id_for_height(height: i32, network_id: u32) -> 
 ///
 /// # Safety
 ///
-/// - `s` should not be a null pointer.
+/// - `s` should be a non-null pointer returned as a string by another zcashlc function.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn zcashlc_string_free(s: *mut c_char) {
     if !s.is_null() {
-        let s = CString::from_raw(s);
+        let s = unsafe { CString::from_raw(s) };
         drop(s);
     }
 }
@@ -2102,7 +2157,7 @@ pub unsafe extern "C" fn zcashlc_string_free(s: *mut c_char) {
 /// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub extern "C" fn zcashlc_shield_funds(
+pub unsafe extern "C" fn zcashlc_shield_funds(
     db_data: *const u8,
     db_data_len: usize,
     usk_ptr: *const u8,
@@ -2113,6 +2168,7 @@ pub extern "C" fn zcashlc_shield_funds(
     output_params: *const u8,
     output_params_len: usize,
     network_id: u32,
+    use_zip317_fees: bool,
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
@@ -2146,7 +2202,7 @@ pub extern "C" fn zcashlc_shield_funds(
             .map_err(|e| format_err!("Error while fetching anchor height: {}", e))
             .and_then(|opt_anchor| {
                 opt_anchor
-                    .map(|(h, _)| h)
+                    .map(|(_, a)| a)
                     .ok_or_else(|| format_err!("height not available; scan required."))
             })
             .and_then(|anchor| {
@@ -2164,16 +2220,41 @@ pub extern "C" fn zcashlc_shield_funds(
             .cloned()
             .collect();
 
-        shield_transparent_funds(
-            &mut update_ops,
-            &network,
-            LocalTxProver::new(spend_params, output_params),
-            &usk,
-            &taddrs,
-            &memo_bytes,
-            ANCHOR_OFFSET,
-        )
-        .map_err(|e| format_err!("Error while shielding transaction: {}", e))
+        if use_zip317_fees {
+            let input_selector = GreedyInputSelector::new(
+                zip317::SingleOutputChangeStrategy::new(Zip317FeeRule::standard()),
+                DustOutputPolicy::default(),
+            );
+
+            shield_transparent_funds(
+                &mut update_ops,
+                &network,
+                LocalTxProver::new(spend_params, output_params),
+                &input_selector,
+                &usk,
+                &taddrs,
+                &memo_bytes,
+                ANCHOR_OFFSET,
+            )
+            .map_err(|e| format_err!("Error while shielding transaction: {}", e))
+        } else {
+            let input_selector = GreedyInputSelector::new(
+                fixed::SingleOutputChangeStrategy::new(FixedFeeRule::standard()),
+                DustOutputPolicy::default(),
+            );
+
+            shield_transparent_funds(
+                &mut update_ops,
+                &network,
+                LocalTxProver::new(spend_params, output_params),
+                &input_selector,
+                &usk,
+                &taddrs,
+                &memo_bytes,
+                ANCHOR_OFFSET,
+            )
+            .map_err(|e| format_err!("Error while shielding transaction: {}", e))
+        }
     });
     unwrap_exc_or(res, -1)
 }
