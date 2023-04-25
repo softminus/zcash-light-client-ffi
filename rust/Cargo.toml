@@ -39,3 +39,6 @@ lto = true
 
 mainnet = ["zcash_client_sqlite/mainnet"]
 testnet = []
+
+[patch.crates-io]
+zcash_client_sqlite = { git = "https://github.com/nuttycom/librustzcash.git", rev = "c3d27e6416d68a4a54b2640e8d38477fba126251" }
