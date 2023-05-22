@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::slice;
 use zcash_primitives::transaction::components::amount::NonNegativeAmount;
-
+use zcash_primitives::transaction::fees::FeeRule;
 use zcash_address::{
     self,
     unified::{self, Container, Encoding},
@@ -25,7 +25,9 @@ use zcash_client_backend::{
         chain::{self, scan_cached_blocks, validate_chain},
         wallet::{
             decrypt_and_store_transaction, input_selection::GreedyInputSelector,
-            shield_transparent_funds, spend,
+            input_selection::InputSelector,
+            input_selection::Proposal, propose_transfer, shield_transparent_funds, spend,
+            create_proposed_transaction
         },
         WalletRead, WalletWrite,
     },
@@ -2193,7 +2195,7 @@ pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
 /// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
 #[no_mangle]
-pub unsafe extern "C" fn zcashlc_create_to_address(
+pub unsafe extern "C" fn zcashlc_propose_transfer_internal(
     db_data: *const u8,
     db_data_len: usize,
     usk_ptr: *const u8,
@@ -2208,8 +2210,8 @@ pub unsafe extern "C" fn zcashlc_create_to_address(
     network_id: u32,
     min_confirmations: u32,
     use_zip317_fees: bool,
-) -> i64 {
-    let res = catch_panic(|| {
+) -> *mut Proposal<dyn FeeRule<Error= zcash_client_backend::data_api::error::Error<SqliteClientError, GreedyInputSelectorError<FeeError, NoteId>, FeeError, NoteId>>, NoteId>   {
+    let unboxed_proposal = catch_panic(|| {
         let network = parse_network(network_id)?;
         let db_read = unsafe { wallet_db(db_data, db_data_len, network)? };
         let mut db_data = db_read.get_update_ops()?;
@@ -2251,6 +2253,9 @@ pub unsafe extern "C" fn zcashlc_create_to_address(
                 }
             }
         }?;
+        let account = db_data
+            .get_account_for_ufvk(&usk.to_unified_full_viewing_key())?
+            .ok_or_else(|| format_err!("Spending key not recognized."))?;
 
         let prover = LocalTxProver::new(spend_params, output_params);
 
@@ -2264,44 +2269,194 @@ pub unsafe extern "C" fn zcashlc_create_to_address(
         }])
         .map_err(|e| format_err!("Error creating transaction request: {:?}", e))?;
 
-        if use_zip317_fees {
-            let input_selector = GreedyInputSelector::new(
-                zip317::SingleOutputChangeStrategy::new(Zip317FeeRule::standard()),
-                DustOutputPolicy::default(),
-            );
+        // if use_zip317_fees {
 
-            spend(
-                &mut db_data,
-                &network,
-                prover,
-                &input_selector,
-                &usk,
-                req,
-                OvkPolicy::Sender,
-                min_confirmations,
-            )
-            .map_err(|e| format_err!("Error while sending funds: {}", e))
-        } else {
-            let input_selector = GreedyInputSelector::new(
-                fixed::SingleOutputChangeStrategy::new(FixedFeeRule::standard()),
-                DustOutputPolicy::default(),
-            );
+        let input_selector = GreedyInputSelector::new(
+            zip317::SingleOutputChangeStrategy::new(Zip317FeeRule::standard()),
+            DustOutputPolicy::default(),
+        );
+        let unboxed_proposal =
+        propose_transfer(
+            &mut db_data,
+            &network,
+            account,
+            &input_selector,
+            req,
+            min_confirmations,
+        ).map_err(|e| format_err!("Error while sending funds: {}", e));
+        unboxed_proposal
 
-            spend(
-                &mut db_data,
-                &network,
-                prover,
-                &input_selector,
-                &usk,
-                req,
-                OvkPolicy::Sender,
-                min_confirmations,
-            )
-            .map_err(|e| format_err!("Error while sending funds: {}", e))
-        }
+    //     } else {
+
+            // let input_selector = GreedyInputSelector::new(
+            //     fixed::SingleOutputChangeStrategy::new(FixedFeeRule::standard()),
+            //     DustOutputPolicy::default(),
+            // );
+
+            // let unboxed_proposal =
+            // propose_transfer(
+            //     &mut db_data,
+            //     &network,
+            //     account,
+            //     &input_selector,
+            //     req,
+            //     min_confirmations,
+            // ).map_err(|e| format_err!("Error while sending funds: {}", e));
+            // unboxed_proposal
+
     });
-    unwrap_exc_or(res, -1)
+
+    match unboxed_proposal {
+        Ok(proposal) => Box::into_raw(Box::new(proposal)),
+        Err(_) => {
+            return ffi_helpers::Nullable::NULL;
+        }
+    }
+
+//   unwrap_exc_or_null(res)
 }
+
+
+
+/// Creates a transaction paying the specified address from the given account.
+///
+/// Returns the row index of the newly-created transaction in the `transactions` table
+/// within the data database. The caller can read the raw transaction bytes from the `raw`
+/// column in order to broadcast the transaction to the network.
+///
+/// Do not call this multiple times in parallel, or you will generate transactions that
+/// double-spend the same notes.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes containing a unified
+///   spending key encoded as returned from the `zcashlc_create_account` or
+///   `zcashlc_derive_spending_key` functions.
+/// - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
+/// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
+///   of pointer::offset.
+/// - `to` must be non-null and must point to a null-terminated UTF-8 string.
+/// - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
+///    512-byte array.
+/// - `spend_params` must be non-null and valid for reads for `spend_params_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be the Sapling spend proving parameters.
+/// - The memory referenced by `spend_params` must not be mutated for the duration of the function call.
+/// - The total size `spend_params_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `output_params` must be non-null and valid for reads for `output_params_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be the Sapling output proving parameters.
+/// - The memory referenced by `output_params` must not be mutated for the duration of the function call.
+/// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+// #[no_mangle]
+// pub unsafe extern "C" fn zcashlc_create_to_address(
+//     db_data: *const u8,
+//     db_data_len: usize,
+//     usk_ptr: *const u8,
+//     usk_len: usize,
+//     to: *const c_char,
+//     value: i64,
+//     memo: *const u8,
+//     spend_params: *const u8,
+//     spend_params_len: usize,
+//     output_params: *const u8,
+//     output_params_len: usize,
+//     network_id: u32,
+//     min_confirmations: u32,
+//     use_zip317_fees: bool,
+// ) -> i64   {
+//     let res = catch_panic( || {
+//         let proposal = unsafe {Box::from_raw(zcashlc_propose_transfer_internal(
+//             db_data,
+//             db_data_len,
+//             usk_ptr,
+//             usk_len,
+//             to,
+//             value,
+//             memo,
+//             spend_params,
+//             spend_params_len,
+//             output_params,
+//             output_params_len,
+//             network_id,
+//             min_confirmations,
+//             use_zip317_fees,
+//         )) };
+//         let network = parse_network(network_id)?;
+//         let db_read = unsafe { wallet_db(db_data, db_data_len, network)? };
+//         let mut db_data = db_read.get_update_ops()?;
+
+//         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
+//         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
+//         let value =
+//             Amount::from_i64(value).map_err(|()| format_err!("Invalid amount, out of range"))?;
+//         if value.is_negative() {
+//             return Err(format_err!("Amount is negative"));
+//         }
+//         let spend_params = Path::new(OsStr::from_bytes(unsafe {
+//             slice::from_raw_parts(spend_params, spend_params_len)
+//         }));
+//         let output_params = Path::new(OsStr::from_bytes(unsafe {
+//             slice::from_raw_parts(output_params, output_params_len)
+//         }));
+
+//         let to = RecipientAddress::decode(&network, to)
+//             .ok_or_else(|| format_err!("PaymentAddress is for the wrong network"))?;
+
+//         let memo = match to {
+//             RecipientAddress::Shielded(_) | RecipientAddress::Unified(_) => {
+//                 if memo.is_null() {
+//                     Ok(None)
+//                 } else {
+//                     MemoBytes::from_bytes(unsafe { slice::from_raw_parts(memo, 512) })
+//                         .map(Some)
+//                         .map_err(|e| format_err!("Invalid MemoBytes {}", e))
+//                 }
+//             }
+//             RecipientAddress::Transparent(_) => {
+//                 if memo.is_null() {
+//                     Ok(None)
+//                 } else {
+//                     Err(format_err!(
+//                         "Memos are not permitted when sending to transparent recipients."
+//                     ))
+//                 }
+//             }
+//         }?;
+//         let account = db_data
+//             .get_account_for_ufvk(&usk.to_unified_full_viewing_key())?
+//             .ok_or_else(|| format_err!("Spending key not recognized."))?;
+
+//         let prover = LocalTxProver::new(spend_params, output_params);
+
+//         let req = TransactionRequest::new(vec![Payment {
+//             recipient_address: to,
+//             amount: value,
+//             memo: memo,
+//             label: None,
+//             message: None,
+//             other_params: vec![],
+//         }])
+//         .map_err(|e| format_err!("Error creating transaction request: {:?}", e))?;
+
+//         create_proposed_transaction(
+//             &mut db_data,
+//             &network,
+//             prover,
+//             &usk,
+//             OvkPolicy::Sender,
+//             *proposal,
+//             memo // do we use this memo or do we feed in None?
+//         ).map_err(|e| format_err!("Error creating proposed transaction: {:?}", e))
+//         });
+//     unwrap_exc_or(res, -1)
+// }
 
 #[no_mangle]
 pub extern "C" fn zcashlc_branch_id_for_height(height: i32, network_id: u32) -> i32 {
